@@ -1719,6 +1719,59 @@ class TestWebSocketProjectQuotaEnforcement:
         assert _refusal_names_the_project_cap(mock_websocket, _TEAM_MODEL_PUBLIC_NAME)
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "frame_body",
+        [
+            {"input": [{"type": "function_call_output", "call_id": "call_1", "output": "log line " * 200}]},
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": [{"type": "input_text", "text": "log line " * 200}],
+                    }
+                ]
+            },
+            {"input": [{"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}" * 900}]},
+            {
+                "input": [
+                    {"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": "+ line\n" * 300}
+                ]
+            },
+            {"input": "hi", "tools": [{"type": "function", "name": "shell", "description": "run a command " * 150}]},
+        ],
+        ids=["tool_output_text", "tool_output_parts", "tool_call_arguments", "custom_tool_call_input", "tools"],
+    )
+    async def test_native_handler_counts_tool_calls_their_outputs_and_tools_toward_the_project_itpm_limit(
+        self, frame_body: Mapping[str, object]
+    ):
+        from unittest.mock import AsyncMock
+
+        from litellm.responses.streaming_iterator import ResponsesWebSocketStreaming
+
+        mock_backend_ws: Final = MagicMock()
+        mock_backend_ws.send = AsyncMock()
+        mock_websocket: Final = MagicMock()
+        mock_websocket.send_text = AsyncMock()
+        handler: Final = ResponsesWebSocketStreaming(
+            websocket=mock_websocket,
+            backend_ws=mock_backend_ws,
+            logging_obj=MagicMock(),
+            user_api_key_dict=_project_key_with_itpm_limit("codex-model", 100),
+            request_data={"litellm_metadata": {"model_group": "codex-model"}},
+            authorized_model="gpt-6.1-sol",
+            quota_callbacks=[_project_quota_limiter()],
+        )
+
+        settlements: Final = await handler._enforce_or_reject_frame(
+            json.dumps({"type": "response.create", **frame_body})
+        )
+
+        assert settlements is None
+        assert _refusal_names_the_project_cap(mock_websocket, "codex-model")
+
+
 def _project_key_with_itpm_limit(model: str, itpm_limit: int):
     from litellm.proxy._types import UserAPIKeyAuth
 
@@ -2081,7 +2134,7 @@ class _TurnByTurnClientSocket(_ClientSocket):
 
     async def send_text(self, data: str) -> None:
         await super().send_text(data)
-        if self.sent[-1].get("type") in ("response.completed", "error"):
+        if self.sent[-1].get("type") in ("response.completed", "response.failed", "error"):
             self.answered.set()
 
     async def receive_text(self) -> str:
@@ -2119,6 +2172,42 @@ class _CompletingBackendSocket:
         return None
 
 
+class _ScriptedBackendSocket:
+    """A provider socket that answers each response.create with the next scripted turn's events."""
+
+    def __init__(self, *turns: tuple[Mapping[str, object], ...]) -> None:
+        self._turns: Final = iter(turns)
+        self._events: Final[asyncio.Queue[str]] = asyncio.Queue()
+        self.received: Final[list[dict[str, object]]] = []
+
+    async def send(self, frame: str) -> None:
+        self.received.append(json.loads(frame))
+        for event in next(self._turns):
+            await self._events.put(json.dumps(dict(event)))
+
+    async def recv(self, decode: bool = True) -> str:
+        return await self._events.get()
+
+    async def close(self) -> None:
+        return None
+
+
+_TURN_CREATED: Final = MappingProxyType({"type": "response.created", "response": {"id": "resp_1"}})
+_TURN_STREAMED_A_MESSAGE: Final = MappingProxyType(
+    {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "role": "assistant"}}
+)
+_TURN_FAILED_WITHOUT_USAGE: Final = MappingProxyType(
+    {"type": "response.failed", "response": {"id": "resp_1", "status": "failed", "usage": None}}
+)
+_TURN_ERRORED: Final = MappingProxyType({"type": "error", "error": {"type": "server_error", "message": "boom"}})
+_TURN_FAILED_REPORTING_TEN_OUTPUT_TOKENS: Final = MappingProxyType(
+    {"type": "response.failed", "response": {"id": "resp_1", "status": "failed", "usage": dict(_TEN_OUTPUT_TOKENS)}}
+)
+_TURN_COMPLETED_WITH_TEN_OUTPUT_TOKENS: Final = MappingProxyType(
+    {"type": "response.completed", "response": {"id": "resp_2", "usage": dict(_TEN_OUTPUT_TOKENS)}}
+)
+
+
 def _project_quota_limiter():
     from litellm.caching.dual_cache import DualCache
     from litellm.proxy.hooks.parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
@@ -2145,6 +2234,7 @@ def _turn_logging_obj() -> MagicMock:
     logging_obj: Final = MagicMock()
     logging_obj.copy_for_new_call.return_value = logging_obj
     logging_obj.dispatch_success_handlers = AsyncMock()
+    logging_obj.dispatch_failure_handlers = AsyncMock()
     return logging_obj
 
 
@@ -2197,6 +2287,46 @@ class TestWebSocketFrameQuotaSettlement:
         assert [frame["input"] for frame in backend_ws.received] == ["fine"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failed_turn", "later_turn_answered"),
+        [
+            ((_TURN_CREATED, _TURN_FAILED_WITHOUT_USAGE), True),
+            ((_TURN_CREATED, _TURN_ERRORED), True),
+            ((_TURN_CREATED, _TURN_STREAMED_A_MESSAGE, _TURN_ERRORED), False),
+            ((_TURN_CREATED, _TURN_STREAMED_A_MESSAGE, _TURN_FAILED_WITHOUT_USAGE), False),
+            ((_TURN_CREATED, _TURN_STREAMED_A_MESSAGE, _TURN_FAILED_REPORTING_TEN_OUTPUT_TOKENS), True),
+        ],
+        ids=[
+            "failed_before_output",
+            "errored_before_output",
+            "errored_after_output",
+            "failed_after_output",
+            "failed_after_output_reporting_usage",
+        ],
+    )
+    async def test_native_relay_settles_a_failed_turn_by_what_it_generated(
+        self, failed_turn: tuple[Mapping[str, object], ...], later_turn_answered: bool
+    ):
+        first, second, _ = _turn_frames()
+        backend_ws: Final = _ScriptedBackendSocket(failed_turn, (_TURN_COMPLETED_WITH_TEN_OUTPUT_TOKENS,))
+        client: Final = _TurnByTurnClientSocket(second)
+        handler: Final = _make_streaming(
+            websocket=client,
+            backend_ws=backend_ws,
+            logging_obj=_turn_logging_obj(),
+            user_api_key_dict=_project_key_with_otpm_limit("codex-model", 1500),
+            request_data={"litellm_metadata": {"model_group": "codex-model"}},
+            authorized_model="gpt-6.1-sol",
+            first_message=first,
+            quota_callbacks=[_project_quota_limiter()],
+        )
+
+        await asyncio.wait_for(handler.bidirectional_forward(), timeout=5)
+
+        assert [frame["input"] for frame in backend_ws.received] == (["one", "two"] if later_turn_answered else ["one"])
+        assert (429 in [status for status, _ in _errors(client)]) is not later_turn_answered
+
+    @pytest.mark.asyncio
     async def test_managed_relay_admits_turns_whose_billed_output_fits_the_project_otpm_limit(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -2245,6 +2375,66 @@ class TestWebSocketFrameQuotaSettlement:
         await handler._process_response_create(second)
 
         assert answered == ["one", "two"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("streamed_before_failing", "later_turn_answered"),
+        [((), True), ((dict(_TURN_STREAMED_A_MESSAGE),), False)],
+        ids=["failed_before_output", "failed_after_output"],
+    )
+    async def test_managed_relay_refunds_a_turn_whose_stream_raised_only_before_it_generated_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        streamed_before_failing: tuple[dict[str, object], ...],
+        later_turn_answered: bool,
+    ):
+        from unittest.mock import AsyncMock
+
+        import litellm
+        from litellm.litellm_core_utils.litellm_logging import Logging
+        from litellm.responses.streaming_iterator import ManagedResponsesWebSocketHandler, drain_logging_tasks
+
+        answered: Final[list[object]] = []
+
+        async def fake_aresponses(**kwargs: object):
+            answered.append(kwargs.get("input"))
+
+            async def stream():
+                if len(answered) > 1:
+                    yield dict(_TURN_COMPLETED_WITH_TEN_OUTPUT_TOKENS)
+                    return
+                for chunk in streamed_before_failing:
+                    yield chunk
+                raise RuntimeError("upstream stream broke")
+
+            return stream()
+
+        monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+        first, second, _ = _turn_frames()
+        websocket: Final = MagicMock()
+        websocket.send_text = AsyncMock()
+        handler: Final = ManagedResponsesWebSocketHandler(
+            websocket=websocket,
+            model="anthropic/claude-sonnet-4-5",
+            logging_obj=Logging(
+                model="anthropic/claude-sonnet-4-5",
+                messages=[],
+                stream=True,
+                call_type="aresponses",
+                start_time=0,
+                litellm_call_id="test-id",
+                function_id="test-func",
+            ),
+            user_api_key_dict=_project_key_with_otpm_limit("claude-model", 1500),
+            litellm_metadata={"model_group": "claude-model"},
+            quota_callbacks=[_project_quota_limiter()],
+        )
+
+        await handler._process_response_create(first)
+        await drain_logging_tasks()
+        await handler._process_response_create(second)
+
+        assert answered == (["one", "two"] if later_turn_answered else ["one"])
 
 
 class TestWebSocketTurnAdmission:

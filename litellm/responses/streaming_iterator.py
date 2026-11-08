@@ -8,7 +8,7 @@ import time
 import traceback
 import uuid
 from collections.abc import AsyncIterable, Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 from itertools import chain
@@ -2130,6 +2130,8 @@ _FRAME_NO_MAX_OUTPUT_TOKENS_FLOOR: Final = 1024
 # the proxy's own rate limiter uses for the same purpose.
 _FRAME_CHARS_PER_TOKEN_ESTIMATE: Final = 4
 
+_FRAME_INPUT_ITEM_TEXT_KEYS: Final = ("content", "text", "output", "arguments", "input", "summary")
+
 
 def _extract_frame_quota_estimate_inputs(msg_obj: Mapping[str, object]) -> tuple[int, int | None]:
     """Extract a rough input-token count and any explicit max_output_tokens
@@ -2157,9 +2159,10 @@ def _extract_frame_quota_estimate_inputs(msg_obj: Mapping[str, object]) -> tuple
                 if isinstance(item, str):
                     text_parts.append(item)
                 elif _is_json_object(item):
-                    pending.append(item.get("content"))
-                    pending.append(item.get("text"))
-    total_chars: Final = sum(len(part) for part in text_parts)
+                    pending.extend(item.get(key) for key in _FRAME_INPUT_ITEM_TEXT_KEYS)
+    tools: Final = params.get("tools")
+    tools_chars: Final = len(json.dumps(tools)) if _is_json_array(tools) and tools else 0
+    total_chars: Final = sum(len(part) for part in text_parts) + tools_chars
     estimated_input_tokens: Final = max(1, total_chars // _FRAME_CHARS_PER_TOKEN_ESTIMATE) if total_chars else 0
 
     max_output_tokens: Final = params.get("max_output_tokens")
@@ -2221,6 +2224,15 @@ def _spawn_frame_quota_settlement(
         _settle_frame_project_quota(settlements, final_response),
         task_name="Responses WebSocket project quota settlement",
     )
+
+
+def _spawn_failed_turn_quota_settlement(
+    settlements: Sequence[FrameQuotaSettlement], failed_response: Mapping[str, object] | None, streamed_output: bool
+) -> None:
+    if not streamed_output:
+        _spawn_frame_quota_settlement(settlements, None)
+    elif failed_response is not None:
+        _spawn_frame_quota_settlement(settlements, failed_response)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2503,11 +2515,19 @@ class _ResponsesWsTurn:
     logging_obj: LiteLLMLoggingObj
     events: tuple[Mapping[str, object], ...] = ()
     quota_settlements: tuple[FrameQuotaSettlement, ...] = ()
+    streamed_output: bool = False
 
     def with_event(self, event: Mapping[str, object]) -> _ResponsesWsTurn:
-        return _ResponsesWsTurn(
-            logging_obj=self.logging_obj, events=(*self.events, event), quota_settlements=self.quota_settlements
-        )
+        return replace(self, events=(*self.events, event))
+
+    def with_streamed_output(self) -> _ResponsesWsTurn:
+        return replace(self, streamed_output=True)
+
+    def settle_quota(self) -> None:
+        if self.events and self.events[-1].get("type") in _HISTORY_TERMINAL_EVENT_TYPES:
+            _spawn_frame_quota_settlement(self.quota_settlements, self.final_response())
+        else:
+            _spawn_failed_turn_quota_settlement(self.quota_settlements, self.final_response(), self.streamed_output)
 
     def final_response(self) -> Mapping[str, object] | None:
         response: Final = self.events[-1].get("response") if self.events else None
@@ -2732,14 +2752,18 @@ class ResponsesWebSocketStreaming:
 
     def _record_backend_event(self, event: str) -> None:
         event_obj: Final = _json_object_or_none(event)
-        if event_obj is None or event_obj.get("type") not in RESPONSES_WS_LOGGED_EVENT_TYPES:
+        event_type: Final = None if event_obj is None else event_obj.get("type")
+        if event_type in _RESPONSES_WS_OUTPUT_ITEM_EVENT_TYPES and self._open_turns:
+            self._open_turns = (self._open_turns[0].with_streamed_output(), *self._open_turns[1:])
+            return
+        if event_obj is None or event_type not in RESPONSES_WS_LOGGED_EVENT_TYPES:
             return
         if not self._open_turns:
             self._start_turn(None)
         turn: Final = self._open_turns[0].with_event(event_obj)
-        if event_obj.get("type") in _RESPONSES_WS_TERMINAL_EVENT_TYPES:
+        if event_type in _RESPONSES_WS_TERMINAL_EVENT_TYPES:
             self._open_turns = self._open_turns[1:]
-            _spawn_frame_quota_settlement(turn.quota_settlements, turn.final_response())
+            turn.settle_quota()
             self._log_turn(turn)
             return
         self._open_turns = (turn, *self._open_turns[1:])
@@ -2791,7 +2815,7 @@ class ResponsesWebSocketStreaming:
 
     async def backend_to_client(self) -> None:
         """Forward events from backend WebSocket to the client."""
-        import websockets
+        from websockets.exceptions import ConnectionClosed
 
         try:
             while True:
@@ -2832,7 +2856,7 @@ class ResponsesWebSocketStreaming:
 
                 await self.websocket.send_text(wrapped_str)
 
-        except websockets.exceptions.ConnectionClosed as e:
+        except ConnectionClosed as e:
             verbose_logger.debug("Responses WS backend connection closed: %s", e)
         except Exception as e:
             verbose_logger.exception("Error in responses WS backend_to_client: %s", e)
@@ -3252,6 +3276,7 @@ class ManagedResponsesWebSocketHandler:
         self.quota_callbacks: tuple[ProjectQuotaCallback, ...] = tuple(quota_callbacks) if quota_callbacks else ()
         self.turn_admission: ResponsesWsTurnAdmission | None = turn_admission
         self._failure: Exception | None = None
+        self._turn_streamed_output: bool = False
         # Carry through safe pass-through kwargs (e.g. extra_headers)
         self.extra_kwargs: dict[str, object] = {k: v for k, v in kwargs.items() if k not in _MANAGED_WS_SKIP_KWARGS}
         # In-memory session history: response_id → full accumulated message list.
@@ -3593,6 +3618,7 @@ class ManagedResponsesWebSocketHandler:
         event dict, or ``None``.
         """
         terminal_event: _MutableJsonObject | None = None
+        self._turn_streamed_output = False
         stream_response: Final = await litellm.aresponses(model=model, **call_kwargs)
         async for chunk in cast(AsyncIterable[object], stream_response):  # cast-ok: aresponses returns an async stream
             if chunk is None:
@@ -3602,6 +3628,8 @@ class ManagedResponsesWebSocketHandler:
             serialized = self._serialize_chunk(chunk)
             if serialized is None:
                 continue
+            if chunk_type in _RESPONSES_WS_OUTPUT_ITEM_EVENT_TYPES:
+                self._turn_streamed_output = True
             if chunk_type in _HISTORY_TERMINAL_EVENT_TYPES and terminal_event is None:
                 try:
                     terminal_event = _load_json_object(serialized)
@@ -3742,7 +3770,7 @@ class ManagedResponsesWebSocketHandler:
             terminal_event: Final = await self._stream_and_forward(model, call_kwargs)
         except Exception as exc:
             verbose_logger.exception("ManagedResponsesWS: error processing response.create: %s", exc)
-            _spawn_frame_quota_settlement(quota_settlements, None)
+            _spawn_failed_turn_quota_settlement(quota_settlements, None, self._turn_streamed_output)
             await self._send_error(str(exc))
             return
 
