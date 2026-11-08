@@ -2740,7 +2740,11 @@ class ResponsesWebSocketStreaming:
             self._remember_pii_tokens(guarded.pii_tokens)
         masked: Final = await self._mask_response_create(guarded.frame)
         self._record_client_frame(masked, guarded.guardrail_information, admitted.reservation, quota_settlements)
-        await self.backend_ws.send(masked)
+        try:
+            await self.backend_ws.send(masked)
+        except Exception:
+            _spawn_frame_quota_settlement(quota_settlements, None)
+            raise
 
     def _remember_pii_tokens(self, pii_tokens: Mapping[str, str]) -> None:
         metadata: Final = self.request_data.get("metadata")

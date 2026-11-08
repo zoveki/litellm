@@ -2192,7 +2192,37 @@ class _ScriptedBackendSocket:
         return None
 
 
-_TURN_CREATED: Final = MappingProxyType({"type": "response.created", "response": {"id": "resp_1"}})
+class _ClosingAfterOneTurnBackendSocket:
+    """A provider socket that, like OpenAI after an ``error`` event, closes once it answered the first turn."""
+
+    def __init__(self, *events: Mapping[str, object]) -> None:
+        self._events: Final = events
+        self._queued: Final[asyncio.Queue[str | None]] = asyncio.Queue()
+        self.attempted_inputs: Final[list[object]] = []
+
+    async def send(self, frame: str) -> None:
+        import websockets.exceptions
+
+        self.attempted_inputs.append(json.loads(frame).get("input"))
+        if len(self.attempted_inputs) > 1:
+            raise websockets.exceptions.ConnectionClosed(None, None)
+        for event in self._events:
+            await self._queued.put(json.dumps(dict(event)))
+        await self._queued.put(None)
+
+    async def recv(self, decode: bool = True) -> str:
+        import websockets.exceptions
+
+        event: Final = await self._queued.get()
+        if event is None:
+            raise websockets.exceptions.ConnectionClosed(None, None)
+        return event
+
+    async def close(self) -> None:
+        return None
+
+
+_TURN_CREATED: Final =MappingProxyType({"type": "response.created", "response": {"id": "resp_1"}})
 _TURN_STREAMED_A_MESSAGE: Final = MappingProxyType(
     {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "role": "assistant"}}
 )
@@ -2325,6 +2355,45 @@ class TestWebSocketFrameQuotaSettlement:
 
         assert [frame["input"] for frame in backend_ws.received] == (["one", "two"] if later_turn_answered else ["one"])
         assert (429 in [status for status, _ in _errors(client)]) is not later_turn_answered
+
+    @pytest.mark.asyncio
+    async def test_native_relay_returns_the_reservation_of_a_frame_sent_after_the_provider_closed_the_socket(self):
+        from litellm.responses.streaming_iterator import drain_logging_tasks
+
+        first, second, third = _turn_frames()
+        limiter: Final = _project_quota_limiter()
+        project_key: Final = _project_key_with_otpm_limit("codex-model", 1500)
+        closing_backend: Final = _ClosingAfterOneTurnBackendSocket(_TURN_ERRORED)
+        handler: Final = _make_streaming(
+            websocket=_TurnByTurnClientSocket(second),
+            backend_ws=closing_backend,
+            logging_obj=_turn_logging_obj(),
+            user_api_key_dict=project_key,
+            request_data={"litellm_metadata": {"model_group": "codex-model"}},
+            authorized_model="gpt-6.1-sol",
+            first_message=first,
+            quota_callbacks=[limiter],
+        )
+        await asyncio.wait_for(handler.bidirectional_forward(), timeout=5)
+        await drain_logging_tasks()
+        peer_backend: Final = _CompletingBackendSocket(_TEN_OUTPUT_TOKENS)
+        peer_client: Final = _TurnByTurnClientSocket()
+        peer: Final = _make_streaming(
+            websocket=peer_client,
+            backend_ws=peer_backend,
+            logging_obj=_turn_logging_obj(),
+            user_api_key_dict=project_key,
+            request_data={"litellm_metadata": {"model_group": "codex-model"}},
+            authorized_model="gpt-6.1-sol",
+            first_message=third,
+            quota_callbacks=[limiter],
+        )
+
+        await asyncio.wait_for(peer.bidirectional_forward(), timeout=5)
+
+        assert closing_backend.attempted_inputs == ["one", "two"]
+        assert _errors(peer_client) == []
+        assert [frame["input"] for frame in peer_backend.received] == ["three"]
 
     @pytest.mark.asyncio
     async def test_managed_relay_admits_turns_whose_billed_output_fits_the_project_otpm_limit(
