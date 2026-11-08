@@ -585,6 +585,18 @@ def _as_counter_values(reply: object) -> list[CacheCounterValue]:
 
 ReservationWindowIdentity: TypeAlias = tuple[str, str, Literal["redis", "local"]]
 
+FrameIoTokenSettlement: TypeAlias = Callable[[Mapping[str, object] | None], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class FrameIoTokenReservation:
+    itpm_scopes: frozenset[tuple[str, str]]
+    itpm_reserved_tokens: int
+    otpm_scopes: frozenset[tuple[str, str]]
+    otpm_reserved_tokens: int
+    reservation_windows: frozenset[ReservationWindowIdentity]
+
+
 ParallelGaugeCacheValue: TypeAlias = dict[str, object] | int | float | str | bytes
 
 
@@ -2932,7 +2944,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         requested_model: str | None,
         estimated_input_tokens: int,
         estimated_output_tokens: int,
-    ) -> None:
+    ) -> FrameIoTokenSettlement | None:
         """Reserve one WebSocket ``response.create`` frame's tokens against
         the caller's project ITPM/OTPM quota.
 
@@ -2940,12 +2952,12 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         per connection, but a connection accepts many ``response.create``
         frames over its lifetime. Without this, a project caller could send
         unlimited high-token generations after a single minimal reservation.
-        There is no per-frame post-call hook to reconcile against, so --
-        like the batch rate limiter -- this charges the estimate immediately
-        and never refunds it.
+        Returns the settlement the relay calls with the turn's final response
+        object (or None when the turn never ran), which moves the reservation
+        to the billed usage the way HTTP's post-call reconciliation does.
         """
         if user_api_key_dict is None:
-            return
+            return None
         descriptors: Final[list[RateLimitDescriptor]] = []  # mutable-ok: descriptor helper appends in place
         self.add_project_io_token_rate_limit_descriptors_from_metadata(
             user_api_key_dict=user_api_key_dict,
@@ -2953,8 +2965,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             descriptors=descriptors,
         )
         if not descriptors:
-            return
-        response, _itpm_reserved, _otpm_reserved = await self.reserve_io_tokens(
+            return None
+        response, itpm_reserved, otpm_reserved = await self.reserve_io_tokens(
             descriptors=descriptors,
             estimated_input_tokens=estimated_input_tokens,
             estimated_output_tokens=estimated_output_tokens,
@@ -2962,6 +2974,53 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         )
         if response["overall_code"] == "OVER_LIMIT":
             self._handle_rate_limit_error(response, descriptors, requested_model)
+        reservation: Final = FrameIoTokenReservation(
+            itpm_scopes=frozenset(
+                (d["key"], d["value"]) for d in descriptors if d["key"] == PROJECT_ITPM_DESCRIPTOR_KEY
+            ),
+            itpm_reserved_tokens=itpm_reserved,
+            otpm_scopes=frozenset(
+                (d["key"], d["value"]) for d in descriptors if d["key"] == PROJECT_OTPM_DESCRIPTOR_KEY
+            ),
+            otpm_reserved_tokens=otpm_reserved,
+            reservation_windows=response.get("reservation_windows", frozenset()),
+        )
+        parent_otel_span: Final = user_api_key_dict.parent_otel_span
+
+        async def settle(final_response: Mapping[str, object] | None) -> None:
+            await self.settle_project_io_token_quota_for_frame(reservation, final_response, parent_otel_span)
+
+        return settle
+
+    @with_service_target("rate_limits")
+    async def settle_project_io_token_quota_for_frame(
+        self,
+        reservation: FrameIoTokenReservation,
+        final_response: Mapping[str, object] | None,
+        parent_otel_span: Span | None = None,
+    ) -> None:
+        billable_input_tokens, completion_tokens, _ = self._resolve_io_token_reconcile_usage(
+            dict(final_response) if final_response is not None else None
+        )
+        await self.async_increment_reservation_aware_tokens(
+            pipeline_operations=(
+                *self._build_project_reservation_ops(
+                    targets=tuple(reservation.itpm_scopes),
+                    reserved_scopes=reservation.itpm_scopes,
+                    actual_tokens=billable_input_tokens,
+                    reserved_tokens=reservation.itpm_reserved_tokens,
+                    reservation_window_identities=reservation.reservation_windows,
+                ),
+                *self._build_project_reservation_ops(
+                    targets=tuple(reservation.otpm_scopes),
+                    reserved_scopes=reservation.otpm_scopes,
+                    actual_tokens=completion_tokens,
+                    reserved_tokens=reservation.otpm_reserved_tokens,
+                    reservation_window_identities=reservation.reservation_windows,
+                ),
+            ),
+            parent_otel_span=parent_otel_span,
+        )
 
     def _rate_limited_model(self, requested_model: str | None) -> RateLimitedModel | None:
         if not requested_model:

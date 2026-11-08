@@ -89,6 +89,9 @@ if TYPE_CHECKING:
     from litellm.types.router import LiteLLM_Params
 
 
+FrameQuotaSettlement: TypeAlias = Callable[[Mapping[str, object] | None], Awaitable[None]]
+
+
 class ProjectQuotaCallback(Protocol):
     async def enforce_project_io_token_quota_for_frame(
         self,
@@ -96,7 +99,7 @@ class ProjectQuotaCallback(Protocol):
         requested_model: str | None,
         estimated_input_tokens: int,
         estimated_output_tokens: int,
-    ) -> None: ...
+    ) -> FrameQuotaSettlement | None: ...
 
 
 @lru_cache(maxsize=1)
@@ -2110,29 +2113,51 @@ async def _enforce_frame_project_quota(
     user_api_key_dict: UserAPIKeyAuth | None,
     model: str | None,
     raw_message: str,
-) -> None:
+) -> tuple[FrameQuotaSettlement, ...]:
     """Charge one response.create frame's estimated tokens against every
     registered project ITPM/OTPM quota callback, in isolation from PII
     masking / logging so a malformed frame still reaches those callbacks."""
     if not quota_callbacks:
-        return
+        return ()
     try:
         msg_obj: Final = _load_json_value(raw_message)
     except (json.JSONDecodeError, TypeError):
-        return
+        return ()
     if not _is_json_object(msg_obj) or msg_obj.get("type") != "response.create":
-        return
+        return ()
     estimated_input_tokens, explicit_max_output_tokens = _extract_frame_quota_estimate_inputs(msg_obj)
     estimated_output_tokens: Final = (
         explicit_max_output_tokens if explicit_max_output_tokens is not None else _FRAME_NO_MAX_OUTPUT_TOKENS_FLOOR
     )
-    for callback in quota_callbacks:
+    settlements: Final = [
         await callback.enforce_project_io_token_quota_for_frame(
             user_api_key_dict=user_api_key_dict,
             requested_model=model,
             estimated_input_tokens=estimated_input_tokens,
             estimated_output_tokens=estimated_output_tokens,
         )
+        for callback in quota_callbacks
+    ]
+    return tuple(settlement for settlement in settlements if settlement is not None)
+
+
+async def _settle_frame_project_quota(
+    settlements: Sequence[FrameQuotaSettlement], final_response: Mapping[str, object] | None
+) -> None:
+    for settle in settlements:
+        await settle(final_response)
+
+
+def _spawn_frame_quota_settlement(
+    settlements: Sequence[FrameQuotaSettlement], final_response: Mapping[str, object] | None
+) -> None:
+    if not settlements:
+        return
+    spawn_logging_task(
+        asyncio.get_running_loop(),
+        _settle_frame_project_quota(settlements, final_response),
+        task_name="Responses WebSocket project quota settlement",
+    )
 
 
 async def _admit_frame_turn(turn_admission: Callable[[], Awaitable[None]] | None, raw_message: str) -> Exception | None:
@@ -2344,9 +2369,16 @@ class _ResponsesWsTurn:
 
     logging_obj: LiteLLMLoggingObj
     events: tuple[Mapping[str, object], ...] = ()
+    quota_settlements: tuple[FrameQuotaSettlement, ...] = ()
 
     def with_event(self, event: Mapping[str, object]) -> _ResponsesWsTurn:
-        return _ResponsesWsTurn(logging_obj=self.logging_obj, events=(*self.events, event))
+        return _ResponsesWsTurn(
+            logging_obj=self.logging_obj, events=(*self.events, event), quota_settlements=self.quota_settlements
+        )
+
+    def final_response(self) -> Mapping[str, object] | None:
+        response: Final = self.events[-1].get("response") if self.events else None
+        return response if _is_json_object(response) else None
 
     def failure(
         self, model: str, custom_llm_provider: str, connection_logging_obj: LiteLLMLoggingObj
@@ -2474,7 +2506,10 @@ class ResponsesWebSocketStreaming:
         self.turn_admission: Callable[[], Awaitable[None]] | None = turn_admission
 
     def _start_turn(
-        self, client_frame: str | None, guardrail_information: tuple[Mapping[str, object], ...] = ()
+        self,
+        client_frame: str | None,
+        guardrail_information: tuple[Mapping[str, object], ...] = (),
+        quota_settlements: tuple[FrameQuotaSettlement, ...] = (),
     ) -> None:
         start_time: Final = datetime.now()  # noqa: DTZ005  # naive to match the logging pipeline start_time
         turn_logging_obj: Final = self.logging_obj.copy_for_new_call(
@@ -2484,7 +2519,10 @@ class ResponsesWebSocketStreaming:
         _set_turn_guardrail_information(turn_logging_obj, guardrail_information)
         turn_logging_obj.model_call_details["messages"] = list(_logged_user_messages(client_frame))
         turn_logging_obj.pre_call(input=client_frame, api_key="")
-        self._open_turns = (*self._open_turns, _ResponsesWsTurn(logging_obj=turn_logging_obj))
+        self._open_turns = (
+            *self._open_turns,
+            _ResponsesWsTurn(logging_obj=turn_logging_obj, quota_settlements=quota_settlements),
+        )
 
     def _detach_budget_reservation(self) -> None:
         """Only the first turn settles the connection's admission reservation; later turns charge their cost directly."""
@@ -2501,11 +2539,14 @@ class ResponsesWebSocketStreaming:
         }
 
     def _record_client_frame(
-        self, client_frame: str, guardrail_information: tuple[Mapping[str, object], ...] = ()
+        self,
+        client_frame: str,
+        guardrail_information: tuple[Mapping[str, object], ...] = (),
+        quota_settlements: tuple[FrameQuotaSettlement, ...] = (),
     ) -> None:
         frame: Final = _json_object_or_none(client_frame)
         if frame is not None and frame.get("type") == "response.create":
-            self._start_turn(client_frame, guardrail_information)
+            self._start_turn(client_frame, guardrail_information, quota_settlements)
 
     async def _guard_frame(self, message: str) -> GuardedResponsesWsFrame | None:
         """Run the proxy's pre_call guardrails on one ``response.create`` frame.
@@ -2524,15 +2565,19 @@ class ResponsesWebSocketStreaming:
             return None
 
     async def _forward_guarded_frame(
-        self, message: str, turn_admission: Callable[[], Awaitable[None]] | None = None
+        self,
+        message: str,
+        turn_admission: Callable[[], Awaitable[None]] | None = None,
+        quota_settlements: tuple[FrameQuotaSettlement, ...] = (),
     ) -> None:
         guarded: Final = await self._guard_frame(message)
         if guarded is None or not await self._admit_or_reject_turn(guarded, message, turn_admission):
+            _spawn_frame_quota_settlement(quota_settlements, None)
             return
         if guarded.pii_tokens:
             self._remember_pii_tokens(guarded.pii_tokens)
         masked: Final = await self._mask_response_create(guarded.frame)
-        self._record_client_frame(masked, guarded.guardrail_information)
+        self._record_client_frame(masked, guarded.guardrail_information, quota_settlements)
         await self.backend_ws.send(masked)
 
     def _remember_pii_tokens(self, pii_tokens: Mapping[str, str]) -> None:
@@ -2552,6 +2597,7 @@ class ResponsesWebSocketStreaming:
         turn: Final = self._open_turns[0].with_event(event_obj)
         if event_obj.get("type") in _RESPONSES_WS_TERMINAL_EVENT_TYPES:
             self._open_turns = self._open_turns[1:]
+            _spawn_frame_quota_settlement(turn.quota_settlements, turn.final_response())
             self._log_turn(turn)
             return
         self._open_turns = (turn, *self._open_turns[1:])
@@ -2915,21 +2961,20 @@ class ResponsesWebSocketStreaming:
 
         return json.dumps(evt_obj) if modified else response_str
 
-    async def _enforce_or_reject_frame(self, message: str) -> bool:
+    async def _enforce_or_reject_frame(self, message: str) -> tuple[FrameQuotaSettlement, ...] | None:
         """Run the per-frame project quota check.
 
-        On rejection, sends an ``error`` event to the client and reports that
-        the frame must be dropped instead of forwarded, so the connection
-        stays open for the client to retry once the window resets.
+        On rejection, sends an ``error`` event to the client and returns None so
+        the frame is dropped instead of forwarded, and the connection stays open
+        for the client to retry once the window resets.
         """
         try:
-            await _enforce_frame_project_quota(
+            return await _enforce_frame_project_quota(
                 self.quota_callbacks, self.user_api_key_dict, self.model_group or self.authorized_model, message
             )
         except RateLimitError as e:
             await self._send_turn_refusal(e)
-            return False
-        return True
+            return None
 
     async def _admit_or_reject_turn(
         self, guarded: GuardedResponsesWsFrame, message: str, turn_admission: Callable[[], Awaitable[None]] | None
@@ -2959,14 +3004,17 @@ class ResponsesWebSocketStreaming:
     async def client_to_backend(self) -> None:
         """Forward response.create events from client to backend."""
         try:
-            if self.first_message is not None and await self._enforce_or_reject_frame(self.first_message):
-                await self._forward_guarded_frame(self.first_message)
+            if (
+                self.first_message is not None
+                and (first_settlements := await self._enforce_or_reject_frame(self.first_message)) is not None
+            ):
+                await self._forward_guarded_frame(self.first_message, quota_settlements=first_settlements)
 
             while True:
                 message = await self.websocket.receive_text()
-                if not await self._enforce_or_reject_frame(message):
+                if (settlements := await self._enforce_or_reject_frame(message)) is None:
                     continue
-                await self._forward_guarded_frame(message, self.turn_admission)
+                await self._forward_guarded_frame(message, self.turn_admission, settlements)
 
         except Exception as e:
             verbose_logger.debug("Responses WS client_to_backend ended: %s", e)
@@ -3499,7 +3547,7 @@ class ManagedResponsesWebSocketHandler:
             return
 
         try:
-            await _enforce_frame_project_quota(
+            quota_settlements: Final = await _enforce_frame_project_quota(
                 self.quota_callbacks, self.user_api_key_dict, self.model_group or self.model, raw_message
             )
         except RateLimitError as e:
@@ -3507,9 +3555,11 @@ class ManagedResponsesWebSocketHandler:
             return
         guarded: Final = await self._guard_frame(raw_message)
         if guarded is None:
+            _spawn_frame_quota_settlement(quota_settlements, None)
             return
         rejection: Final = await _admit_frame_turn(turn_admission, raw_message)
         if rejection is not None:
+            _spawn_frame_quota_settlement(quota_settlements, None)
             if self._failure is None:
                 self._failure = rejection
             await _reject_guarded_turn(self.websocket, guarded, rejection)
@@ -3548,9 +3598,15 @@ class ManagedResponsesWebSocketHandler:
             terminal_event: Final = await self._stream_and_forward(model, call_kwargs)
         except Exception as exc:
             verbose_logger.exception("ManagedResponsesWS: error processing response.create: %s", exc)
+            _spawn_frame_quota_settlement(quota_settlements, None)
             await self._send_error(str(exc))
             return
 
+        if terminal_event is not None:
+            terminal_response: Final = terminal_event.get("response")
+            _spawn_frame_quota_settlement(
+                quota_settlements, terminal_response if _is_json_object(terminal_response) else None
+            )
         self._save_turn_history(terminal_event, prior_history, current_messages)
 
     # ------------------------------------------------------------------
