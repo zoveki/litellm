@@ -2063,6 +2063,11 @@ async def _read_ws_model_from_first_frame(
     return model, first_message
 
 
+def _requested_model(data: Mapping[str, object]) -> str | None:
+    model: Final = data.get("model")
+    return model if isinstance(model, str) else None
+
+
 def _extract_model_from_first_ws_event(first_event: object) -> str | None:
     """Extract model from a response.create WS event, handling flat and nested formats.
 
@@ -2662,6 +2667,7 @@ async def _responses_websocket_session(
         responses_ws_frame_guard=_responses_ws_frame_guard(
             data, user_api_key_dict, proxy_logging_obj, refused_turns.add
         ),
+        responses_ws_caller_model=_requested_model(data),
         **_routing_hints_from_first_ws_frame(first_message),
     )
 

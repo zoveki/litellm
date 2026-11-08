@@ -1339,6 +1339,13 @@ class TestWebSocketErrorHandling:
         assert "Invalid JSON" in error_event
 
 
+_CALLER_MODEL_CASES: Final = pytest.mark.parametrize(
+    ("connection_model_group", "caller_model"),
+    [("model_name_team1_abc", "team-codex"), ("backup-model", "primary-model")],
+    ids=["team_model_public_name", "connection_time_fallback"],
+)
+
+
 class TestWebSocketProjectQuotaEnforcement:
     """VERIA regression: the connection-level pre-call hook only runs once,
     but a WebSocket connection accepts many response.create frames. Every
@@ -1644,6 +1651,96 @@ class TestWebSocketProjectQuotaEnforcement:
         error_event: Final = json.loads(mock_websocket.send_text.call_args[0][0])
         assert (error_event["status"], error_event["error"]["type"]) == (429, "rate_limit_exceeded")
         assert f"ws-project:{limited_model}" in error_event["error"]["message"]
+
+    @pytest.mark.asyncio
+    @_CALLER_MODEL_CASES
+    async def test_native_handler_refuses_a_frame_over_the_project_itpm_limit_of_the_model_the_caller_sent(
+        self, connection_model_group: str, caller_model: str
+    ):
+        from unittest.mock import AsyncMock
+
+        from litellm.responses.streaming_iterator import ResponsesWebSocketStreaming
+
+        mock_backend_ws: Final = MagicMock()
+        mock_backend_ws.send = AsyncMock()
+        mock_websocket: Final = MagicMock()
+        mock_websocket.send_text = AsyncMock()
+        handler: Final = ResponsesWebSocketStreaming(
+            websocket=mock_websocket,
+            backend_ws=mock_backend_ws,
+            logging_obj=MagicMock(),
+            user_api_key_dict=_project_key_with_itpm_limit(caller_model, 100),
+            request_data={"litellm_metadata": {"model_group": connection_model_group}},
+            caller_model=caller_model,
+            authorized_model="gpt-6.1-sol",
+            quota_callbacks=[_project_quota_limiter()],
+        )
+
+        settlements: Final = await handler._enforce_or_reject_frame(
+            json.dumps({"type": "response.create", "input": "long " * 400})
+        )
+
+        assert settlements is None
+        assert _refusal_names_the_project_cap(mock_websocket, caller_model)
+
+    @pytest.mark.asyncio
+    @_CALLER_MODEL_CASES
+    async def test_managed_handler_refuses_a_frame_over_the_project_itpm_limit_of_the_model_the_caller_sent(
+        self, monkeypatch: pytest.MonkeyPatch, connection_model_group: str, caller_model: str
+    ):
+        from unittest.mock import AsyncMock
+
+        import litellm
+        from litellm.litellm_core_utils.litellm_logging import Logging
+        from litellm.responses.streaming_iterator import ManagedResponsesWebSocketHandler
+
+        answered: Final[list[object]] = []
+
+        async def fake_aresponses(**kwargs: object) -> None:
+            answered.append(kwargs.get("input"))
+
+        monkeypatch.setattr(litellm, "aresponses", fake_aresponses)
+        mock_websocket: Final = MagicMock()
+        mock_websocket.send_text = AsyncMock()
+        handler: Final = ManagedResponsesWebSocketHandler(
+            websocket=mock_websocket,
+            model="anthropic/claude-sonnet-4-5",
+            logging_obj=Logging(
+                model="anthropic/claude-sonnet-4-5",
+                messages=[],
+                stream=True,
+                call_type="aresponses",
+                start_time=0,
+                litellm_call_id="test-id",
+                function_id="test-func",
+            ),
+            user_api_key_dict=_project_key_with_itpm_limit(caller_model, 100),
+            litellm_metadata={"model_group": connection_model_group},
+            caller_model=caller_model,
+            quota_callbacks=[_project_quota_limiter()],
+        )
+
+        await handler._process_response_create(json.dumps({"type": "response.create", "input": "long " * 400}))
+
+        assert answered == []
+        assert _refusal_names_the_project_cap(mock_websocket, caller_model)
+
+
+def _project_key_with_itpm_limit(model: str, itpm_limit: int):
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    return UserAPIKeyAuth(
+        api_key="hashed-ws-project-key",
+        project_id="ws-project",
+        project_metadata={"model_itpm_limit": {model: itpm_limit}},
+    )
+
+
+def _refusal_names_the_project_cap(websocket: MagicMock, model: str) -> bool:
+    error_event: Final = json.loads(websocket.send_text.call_args[0][0])
+    return (error_event["status"], error_event["error"]["type"]) == (429, "rate_limit_exceeded") and (
+        f"ws-project:{model}" in error_event["error"]["message"]
+    )
 
 
 def _turn_frames() -> tuple[str, str, str]:
@@ -2408,6 +2505,41 @@ class TestWebSocketTurnAdmission:
             )
 
         assert [frame.get("metadata") for frame in provider.sent] == [client_metadata, client_metadata]
+
+    @pytest.mark.asyncio
+    async def test_routed_native_relay_checks_frames_against_the_project_cap_of_the_model_the_caller_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import patch
+
+        import litellm
+        from litellm import Router
+
+        monkeypatch.setenv("LITELLM_RUST", "false")
+        monkeypatch.setattr(litellm, "callbacks", [_project_quota_limiter()])
+        provider: Final = _ProviderResponsesSocket()
+        client: Final = _ClientSocket()
+        router: Final = Router(
+            model_list=[
+                {
+                    "model_name": "model_name_team1_abc",
+                    "litellm_params": {"model": "openai/gpt-5-mini", "api_key": "sk-fake"},
+                    "model_info": {"id": "ws-team-dep"},
+                }
+            ],
+        )
+
+        with patch("websockets.connect", provider.connect):
+            await router._aresponses_websocket(
+                model="model_name_team1_abc",
+                websocket=client,
+                first_message=json.dumps({"type": "response.create", "input": "long " * 400}),
+                user_api_key_dict=_project_key_with_itpm_limit("team-codex", 100),
+                responses_ws_caller_model="team-codex",
+            )
+
+        assert provider.sent == []
+        assert [(status, error["type"]) for status, error in _errors(client)] == [(429, "rate_limit_exceeded")]
 
     @pytest.mark.asyncio
     async def test_managed_relay_skips_a_later_turn_the_deployment_refuses(self, monkeypatch: pytest.MonkeyPatch):

@@ -2646,6 +2646,7 @@ class TestResponsesWSFirstFrameModelAuth:
         assert processor.common_processing_pre_call_logic.await_args.kwargs["model"] == "gpt-4o-mini"
         assert processor.common_processing_pre_call_logic.await_args.kwargs["skip_guardrails"] is True
         assert callable(routed["responses_ws_frame_guard"])
+        assert routed["responses_ws_caller_model"] == "gpt-4o-mini"
         assert mock_route_request.await_args.kwargs["route_type"] == "_aresponses_websocket"
         ws.close.assert_not_awaited()
 

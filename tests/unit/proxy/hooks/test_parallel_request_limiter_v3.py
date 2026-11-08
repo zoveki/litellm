@@ -3490,6 +3490,42 @@ async def test_settling_a_frame_charges_the_project_the_input_tokens_the_turn_bi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("final_response", "estimated_output_tokens"),
+    [({"id": "resp_1", "status": "completed"}, 1024), ({"id": "resp_1", "usage": {"total_tokens": 1450}}, 100)],
+    ids=["no_usage_keeps_the_estimate", "aggregate_total_is_charged"],
+)
+async def test_settling_a_finished_turn_without_split_usage_keeps_the_project_charged(
+    final_response: dict[str, object], estimated_output_tokens: int
+):
+    handler: Final = _PROXY_MaxParallelRequestsHandler(internal_usage_cache=InternalUsageCache(DualCache()))
+    user_api_key_dict: Final = UserAPIKeyAuth(
+        api_key=hash_token("sk-ws-frame-settle-no-split"),
+        project_id="proj-ws-settle-no-split",
+        project_metadata={"model_otpm_limit": {"gpt-4o": 1500}},
+    )
+
+    settle: Final = await handler.enforce_project_io_token_quota_for_frame(
+        user_api_key_dict=user_api_key_dict,
+        requested_model="gpt-4o",
+        estimated_input_tokens=1,
+        estimated_output_tokens=estimated_output_tokens,
+    )
+    assert settle is not None
+    await settle(final_response)
+
+    with pytest.raises(HTTPException) as exc:
+        await handler.enforce_project_io_token_quota_for_frame(
+            user_api_key_dict=user_api_key_dict,
+            requested_model="gpt-4o",
+            estimated_input_tokens=1,
+            estimated_output_tokens=estimated_output_tokens,
+        )
+
+    assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
 async def test_pre_call_hook_keeps_internal_stash_out_of_request_body():
     """Regression for #27001 / #35197: the limiter's per-request bookkeeping
     must never touch the outgoing request body — no top-level keys and no

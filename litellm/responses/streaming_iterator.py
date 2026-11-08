@@ -2610,6 +2610,7 @@ class ResponsesWebSocketStreaming:
         guardrail_callbacks: Sequence[PresidioGuardrailCallback] | None = None,
         output_guardrail_callbacks: list[PresidioGuardrailCallback] | None = None,
         quota_callbacks: Sequence[ProjectQuotaCallback] | None = None,
+        caller_model: str | None = None,
         authorized_model: str | None = None,
         custom_llm_provider: str | None = None,
         request_defaults: ResponsesWebSocketRequestDefaults | None = None,
@@ -2625,6 +2626,7 @@ class ResponsesWebSocketStreaming:
         litellm_metadata: Final = self.request_data.get("litellm_metadata")
         self.litellm_metadata: dict[str, object] = litellm_metadata if _is_json_object(litellm_metadata) else {}
         self.model_group: str | None = _connection_model_group(self.litellm_metadata)
+        self.quota_model: str | None = caller_model or self.model_group
         self.custom_llm_provider: str | None = custom_llm_provider
         self._open_turns: tuple[_ResponsesWsTurn, ...] = ()
         self._failure: Exception | None = None
@@ -3110,7 +3112,7 @@ class ResponsesWebSocketStreaming:
         """
         try:
             return await _enforce_frame_project_quota(
-                self.quota_callbacks, self.user_api_key_dict, self.model_group or self.authorized_model, message
+                self.quota_callbacks, self.user_api_key_dict, self.quota_model or self.authorized_model, message
             )
         except RateLimitError as e:
             await self._send_turn_refusal(e)
@@ -3225,6 +3227,7 @@ class ManagedResponsesWebSocketHandler:
         custom_llm_provider: str | None = None,
         first_message: str | None = None,
         quota_callbacks: Sequence[ProjectQuotaCallback] | None = None,
+        caller_model: str | None = None,
         turn_admission: ResponsesWsTurnAdmission | None = None,
         frame_guard: ResponsesWsFrameGuard | None = None,
         guardrail_callbacks: Sequence[PresidioGuardrailCallback] | None = None,
@@ -3239,6 +3242,7 @@ class ManagedResponsesWebSocketHandler:
         self.user_api_key_dict = user_api_key_dict
         self.litellm_metadata: Mapping[str, object] = litellm_metadata or {}
         self.model_group: str | None = _connection_model_group(self.litellm_metadata)
+        self.quota_model: str | None = caller_model or self.model_group
         self.api_key = api_key
         self.api_base = api_base
         self.timeout = timeout
@@ -3682,7 +3686,7 @@ class ManagedResponsesWebSocketHandler:
 
         try:
             quota_settlements: Final = await _enforce_frame_project_quota(
-                self.quota_callbacks, self.user_api_key_dict, self.model_group or self.model, raw_message
+                self.quota_callbacks, self.user_api_key_dict, self.quota_model or self.model, raw_message
             )
         except RateLimitError as e:
             await self._send_frame(turn_refusal_frame(e))

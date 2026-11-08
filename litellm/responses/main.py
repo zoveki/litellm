@@ -2871,6 +2871,7 @@ async def _aresponses_websocket(
     timeout: float | None = None,
     turn_admission: "ResponsesWsTurnAdmission | None" = None,
     responses_ws_frame_guard: "ResponsesWsFrameGuard | None" = None,
+    responses_ws_caller_model: str | None = None,
     **kwargs,
 ) -> Exception | None:
     """
@@ -2965,5 +2966,6 @@ async def _aresponses_websocket(
         request_defaults=_build_responses_websocket_request_defaults(deployment_kwargs),
         turn_admission=turn_admission,
         frame_guard=responses_ws_frame_guard,
+        caller_model=responses_ws_caller_model,
         **remaining_kwargs,
     )

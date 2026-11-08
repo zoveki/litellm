@@ -2438,9 +2438,10 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         final_response: Mapping[str, object] | None,
         parent_otel_span: Span | None = None,
     ) -> None:
-        billable_input_tokens, completion_tokens, _ = self._resolve_io_token_reconcile_usage(
-            dict(final_response) if final_response is not None else None
-        )
+        settled_usage: Final = self._frame_settled_usage(final_response)
+        if settled_usage is None:
+            return
+        billable_input_tokens, completion_tokens = settled_usage
         await self.async_increment_reservation_aware_tokens(
             pipeline_operations=(
                 *self._build_project_reservation_ops(
@@ -2460,6 +2461,16 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             ),
             parent_otel_span=parent_otel_span,
         )
+
+    def _frame_settled_usage(self, final_response: Mapping[str, object] | None) -> tuple[int, int] | None:
+        if final_response is None:
+            return 0, 0
+        response: Final = dict(final_response)
+        billable_input_tokens, completion_tokens, usage_resolved = self._resolve_io_token_reconcile_usage(response)
+        if usage_resolved:
+            return billable_input_tokens, completion_tokens
+        aggregate_total: Final = self._aggregate_only_total_tokens(self._response_usage(response))
+        return (aggregate_total, aggregate_total) if aggregate_total > 0 else None
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def enforce_token_limits_for_frame(
