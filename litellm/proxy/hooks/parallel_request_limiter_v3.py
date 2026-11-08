@@ -2431,7 +2431,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
 
         return settle
 
-    @with_service_target("rate_limits")
+    @with_service_target(RATE_LIMITS_TARGET)
     async def settle_project_io_token_quota_for_frame(
         self,
         reservation: FrameIoTokenReservation,
