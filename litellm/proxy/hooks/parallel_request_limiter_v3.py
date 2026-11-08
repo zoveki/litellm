@@ -2382,7 +2382,7 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth | None,
         requested_model: str | None,
         estimated_input_tokens: int,
-        estimated_output_tokens: int,
+        estimated_output_tokens: int | None,
     ) -> FrameIoTokenSettlement | None:
         """Reserve one WebSocket ``response.create`` frame's tokens against
         the caller's project ITPM/OTPM quota.
@@ -2408,7 +2408,11 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         response, itpm_reserved, otpm_reserved = await self.reserve_io_tokens(
             descriptors=descriptors,
             estimated_input_tokens=estimated_input_tokens,
-            estimated_output_tokens=estimated_output_tokens,
+            estimated_output_tokens=(
+                estimated_output_tokens
+                if estimated_output_tokens is not None
+                else self._frame_no_max_output_tokens_floor(descriptors)
+            ),
             parent_otel_span=user_api_key_dict.parent_otel_span,
         )
         if response["overall_code"] == "OVER_LIMIT":
@@ -2430,6 +2434,16 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             await self.settle_project_io_token_quota_for_frame(reservation, final_response, parent_otel_span)
 
         return settle
+
+    @staticmethod
+    def _frame_no_max_output_tokens_floor(descriptors: Sequence[RateLimitDescriptor]) -> int:
+        otpm_descriptors: Final = tuple(d for d in descriptors if d["key"] == PROJECT_OTPM_DESCRIPTOR_KEY)
+        return max(
+            _PROXY_MaxParallelRequestsHandler_v3.no_max_tokens_output_floor(
+                _minimum_descriptor_limit(otpm_descriptors, "tokens_per_unit")
+            ),
+            RESPONSES_API_MIN_OUTPUT_TOKENS,
+        )
 
     @with_service_target(RATE_LIMITS_TARGET)
     async def settle_project_io_token_quota_for_frame(

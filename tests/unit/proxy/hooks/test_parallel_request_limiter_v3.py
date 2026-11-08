@@ -37,6 +37,7 @@ from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitErro
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PARALLEL_REQUEST_SLOT_TTL_SECONDS,
+    RESPONSES_API_MIN_OUTPUT_TOKENS,
     ParallelSlotAcquisition,
     PROXY_MaxParallelRequestsHandler_v3,
     RateLimitDescriptor,
@@ -3523,6 +3524,40 @@ async def test_settling_a_finished_turn_without_split_usage_keeps_the_project_ch
         )
 
     assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("otpm_limit", [800, 40, 8000])
+async def test_a_frame_without_an_output_cap_reserves_the_floor_http_reserves_for_the_project_otpm_limit(
+    otpm_limit: int,
+):
+    handler: Final = _PROXY_MaxParallelRequestsHandler(internal_usage_cache=InternalUsageCache(DualCache()))
+    user_api_key_dict: Final = UserAPIKeyAuth(
+        api_key=hash_token("sk-ws-frame-uncapped-floor"),
+        project_id="proj-ws-frame-uncapped-floor",
+        project_metadata={"model_otpm_limit": {"gpt-4o": otpm_limit}},
+    )
+    http_floor: Final = max(
+        _PROXY_MaxParallelRequestsHandler.no_max_tokens_output_floor(otpm_limit), RESPONSES_API_MIN_OUTPUT_TOKENS
+    )
+
+    for _ in range(otpm_limit // http_floor):
+        await handler.enforce_project_io_token_quota_for_frame(
+            user_api_key_dict=user_api_key_dict,
+            requested_model="gpt-4o",
+            estimated_input_tokens=1,
+            estimated_output_tokens=None,
+        )
+    with pytest.raises(HTTPException) as exc:
+        await handler.enforce_project_io_token_quota_for_frame(
+            user_api_key_dict=user_api_key_dict,
+            requested_model="gpt-4o",
+            estimated_input_tokens=1,
+            estimated_output_tokens=None,
+        )
+
+    assert exc.value.status_code == 429
+    assert "model_per_project_otpm" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio

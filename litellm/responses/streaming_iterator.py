@@ -101,7 +101,7 @@ class ProjectQuotaCallback(Protocol):
         user_api_key_dict: UserAPIKeyAuth | None,
         requested_model: str | None,
         estimated_input_tokens: int,
-        estimated_output_tokens: int,
+        estimated_output_tokens: int | None,
     ) -> FrameQuotaSettlement | None: ...
 
 
@@ -2120,11 +2120,6 @@ def build_synthetic_response_events(
 
 from litellm._logging import verbose_logger
 
-# Conservative per-frame output-token floor used when a response.create
-# frame omits max_output_tokens, so a project OTPM quota can't be bypassed
-# by simply never declaring an output cap.
-_FRAME_NO_MAX_OUTPUT_TOKENS_FLOOR: Final = 1024
-
 # Rough chars-per-token ratio for estimating a frame's input tokens without
 # resolving a real per-model tokenizer, matching the conservative estimate
 # the proxy's own rate limiter uses for the same purpose.
@@ -2192,15 +2187,12 @@ async def _enforce_frame_project_quota(
     if not _is_json_object(msg_obj) or msg_obj.get("type") != "response.create":
         return ()
     estimated_input_tokens, explicit_max_output_tokens = _extract_frame_quota_estimate_inputs(msg_obj)
-    estimated_output_tokens: Final = (
-        explicit_max_output_tokens if explicit_max_output_tokens is not None else _FRAME_NO_MAX_OUTPUT_TOKENS_FLOOR
-    )
     settlements: Final = [
         await callback.enforce_project_io_token_quota_for_frame(
             user_api_key_dict=user_api_key_dict,
             requested_model=model,
             estimated_input_tokens=estimated_input_tokens,
-            estimated_output_tokens=estimated_output_tokens,
+            estimated_output_tokens=explicit_max_output_tokens,
         )
         for callback in quota_callbacks
     ]
@@ -3617,9 +3609,9 @@ class ManagedResponsesWebSocketHandler:
         """
         Stream ``litellm.aresponses`` and forward every chunk over the WebSocket.
 
-        Captures the first terminal (``response.completed`` or ``response.incomplete``) event from the chunk object
-        directly (before serialization) to avoid a redundant JSON round-trip on every chunk. Returns the terminal
-        event dict, or ``None``.
+        Captures the first terminal (``response.completed``, ``response.incomplete``, ``response.failed`` or
+        ``error``) event from the chunk object directly (before serialization) to avoid a redundant JSON round-trip
+        on every chunk. Returns the terminal event dict, or ``None``.
         """
         terminal_event: _MutableJsonObject | None = None
         self._turn_streamed_output = False
@@ -3634,7 +3626,7 @@ class ManagedResponsesWebSocketHandler:
                 continue
             if chunk_type in _RESPONSES_WS_OUTPUT_ITEM_EVENT_TYPES:
                 self._turn_streamed_output = True
-            if chunk_type in _HISTORY_TERMINAL_EVENT_TYPES and terminal_event is None:
+            if chunk_type in _RESPONSES_WS_TERMINAL_EVENT_TYPES and terminal_event is None:
                 try:
                     terminal_event = _load_json_object(serialized)
                 except Exception:
@@ -3778,11 +3770,14 @@ class ManagedResponsesWebSocketHandler:
             await self._send_error(str(exc))
             return
 
-        if terminal_event is not None:
-            terminal_response: Final = terminal_event.get("response")
-            _spawn_frame_quota_settlement(
-                quota_settlements, terminal_response if _is_json_object(terminal_response) else None
-            )
+        if terminal_event is None:
+            return
+        terminal_response: Final = terminal_event.get("response")
+        settled_response: Final = terminal_response if _is_json_object(terminal_response) else None
+        if terminal_event.get("type") in _RESPONSES_WS_FAILURE_EVENT_TYPES:
+            _spawn_failed_turn_quota_settlement(quota_settlements, settled_response, self._turn_streamed_output)
+            return
+        _spawn_frame_quota_settlement(quota_settlements, settled_response)
         self._save_turn_history(terminal_event, prior_history, current_messages)
 
     # ------------------------------------------------------------------
