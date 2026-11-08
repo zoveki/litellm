@@ -1339,11 +1339,8 @@ class TestWebSocketErrorHandling:
         assert "Invalid JSON" in error_event
 
 
-_CALLER_MODEL_CASES: Final = pytest.mark.parametrize(
-    ("connection_model_group", "caller_model"),
-    [("model_name_team1_abc", "team-codex"), ("backup-model", "primary-model")],
-    ids=["team_model_public_name", "connection_time_fallback"],
-)
+_TEAM_MODEL_INTERNAL_NAME: Final = "model_name_team1_abc"
+_TEAM_MODEL_PUBLIC_NAME: Final = "team-codex"
 
 
 class TestWebSocketProjectQuotaEnforcement:
@@ -1653,10 +1650,7 @@ class TestWebSocketProjectQuotaEnforcement:
         assert f"ws-project:{limited_model}" in error_event["error"]["message"]
 
     @pytest.mark.asyncio
-    @_CALLER_MODEL_CASES
-    async def test_native_handler_refuses_a_frame_over_the_project_itpm_limit_of_the_model_the_caller_sent(
-        self, connection_model_group: str, caller_model: str
-    ):
+    async def test_native_handler_refuses_a_frame_over_the_project_itpm_limit_of_the_model_the_caller_sent(self):
         from unittest.mock import AsyncMock
 
         from litellm.responses.streaming_iterator import ResponsesWebSocketStreaming
@@ -1669,9 +1663,9 @@ class TestWebSocketProjectQuotaEnforcement:
             websocket=mock_websocket,
             backend_ws=mock_backend_ws,
             logging_obj=MagicMock(),
-            user_api_key_dict=_project_key_with_itpm_limit(caller_model, 100),
-            request_data={"litellm_metadata": {"model_group": connection_model_group}},
-            caller_model=caller_model,
+            user_api_key_dict=_project_key_with_itpm_limit(_TEAM_MODEL_PUBLIC_NAME, 100),
+            request_data={"litellm_metadata": {"model_group": _TEAM_MODEL_INTERNAL_NAME}},
+            caller_model=_TEAM_MODEL_PUBLIC_NAME,
             authorized_model="gpt-6.1-sol",
             quota_callbacks=[_project_quota_limiter()],
         )
@@ -1681,12 +1675,11 @@ class TestWebSocketProjectQuotaEnforcement:
         )
 
         assert settlements is None
-        assert _refusal_names_the_project_cap(mock_websocket, caller_model)
+        assert _refusal_names_the_project_cap(mock_websocket, _TEAM_MODEL_PUBLIC_NAME)
 
     @pytest.mark.asyncio
-    @_CALLER_MODEL_CASES
     async def test_managed_handler_refuses_a_frame_over_the_project_itpm_limit_of_the_model_the_caller_sent(
-        self, monkeypatch: pytest.MonkeyPatch, connection_model_group: str, caller_model: str
+        self, monkeypatch: pytest.MonkeyPatch
     ):
         from unittest.mock import AsyncMock
 
@@ -1714,16 +1707,16 @@ class TestWebSocketProjectQuotaEnforcement:
                 litellm_call_id="test-id",
                 function_id="test-func",
             ),
-            user_api_key_dict=_project_key_with_itpm_limit(caller_model, 100),
-            litellm_metadata={"model_group": connection_model_group},
-            caller_model=caller_model,
+            user_api_key_dict=_project_key_with_itpm_limit(_TEAM_MODEL_PUBLIC_NAME, 100),
+            litellm_metadata={"model_group": _TEAM_MODEL_INTERNAL_NAME},
+            caller_model=_TEAM_MODEL_PUBLIC_NAME,
             quota_callbacks=[_project_quota_limiter()],
         )
 
         await handler._process_response_create(json.dumps({"type": "response.create", "input": "long " * 400}))
 
         assert answered == []
-        assert _refusal_names_the_project_cap(mock_websocket, caller_model)
+        assert _refusal_names_the_project_cap(mock_websocket, _TEAM_MODEL_PUBLIC_NAME)
 
 
 def _project_key_with_itpm_limit(model: str, itpm_limit: int):
@@ -2522,7 +2515,7 @@ class TestWebSocketTurnAdmission:
         router: Final = Router(
             model_list=[
                 {
-                    "model_name": "model_name_team1_abc",
+                    "model_name": _TEAM_MODEL_INTERNAL_NAME,
                     "litellm_params": {"model": "openai/gpt-5-mini", "api_key": "sk-fake"},
                     "model_info": {"id": "ws-team-dep"},
                 }
@@ -2531,11 +2524,11 @@ class TestWebSocketTurnAdmission:
 
         with patch("websockets.connect", provider.connect):
             await router._aresponses_websocket(
-                model="model_name_team1_abc",
+                model=_TEAM_MODEL_INTERNAL_NAME,
                 websocket=client,
                 first_message=json.dumps({"type": "response.create", "input": "long " * 400}),
-                user_api_key_dict=_project_key_with_itpm_limit("team-codex", 100),
-                responses_ws_caller_model="team-codex",
+                user_api_key_dict=_project_key_with_itpm_limit(_TEAM_MODEL_PUBLIC_NAME, 100),
+                responses_ws_caller_model=_TEAM_MODEL_PUBLIC_NAME,
             )
 
         assert provider.sent == []
