@@ -677,7 +677,6 @@ def completed_stream_history(
     *,
     completed: bool,
     structured_output: bool,
-    streamed_phases: bool,
 ) -> dict[str, object] | None:  # mutable-ok: Delta.provider_specific_fields is typed as a dict
     items: Final = _STREAMED_OUTPUT_ITEMS.validate_python(output_payload)
     calls: Final = tuple(item for item in items if item.get("type") in ("function_call", "custom_tool_call"))
@@ -689,17 +688,10 @@ def completed_stream_history(
         "provider_specific_fields": tool_search_fields,
     }
     fields: Final = {
-        **({PHASE_FIELD: None} if streamed_phases else {}),
         **(tool_search_fields or {}),
         **replay_fields(items, streamed_message, completed=completed, first_message_only=structured_output),
     }
     return fields or None
-
-
-def _text_delta(content: object, phase: Phase | None) -> Delta:
-    if phase is None:
-        return Delta(content=content)
-    return Delta(content=content, provider_specific_fields={PHASE_FIELD: phase})
 
 
 def _assistant_phase_field(msg: object, replay_openai_history: bool, drop_params: bool) -> Mapping[str, object]:
@@ -2197,7 +2189,6 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         replays_openai_history: bool = False,
         structured_output: bool = False,
         item_phase: Phase | None = None,
-        streamed_phases: bool = False,
         reasoning_summary_streamed: bool = False,
     ) -> "ModelResponseStream":
         """
@@ -2209,7 +2200,6 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
             replays_openai_history: Record the completed output's item sequence for the next turn
             structured_output: Only the first message item became content
             item_phase: Phase of the message item this chunk belongs to
-            streamed_phases: A response.output_item.added event of this stream named a message phase
             reasoning_summary_streamed: Whether earlier chunks already streamed reasoning summary text
 
         Returns:
@@ -2383,10 +2373,11 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                     choices=[
                         StreamingChoices(
                             index=0,
-                            delta=_text_delta(content_part, item_phase),
+                            delta=Delta(content=content_part),
                             finish_reason=None,
                         )
-                    ]
+                    ],
+                    provider_specific_fields={PHASE_FIELD: item_phase} if item_phase is not None else None,
                 )
             else:
                 raise ValueError(f"Chat provider: Invalid text delta {parsed_chunk}")
@@ -2447,7 +2438,6 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                                     tool_search_fields,
                                     completed=event_type == "response.completed",
                                     structured_output=structured_output,
-                                    streamed_phases=streamed_phases,
                                 )
                                 if replays_openai_history
                                 else tool_search_fields
@@ -2509,7 +2499,6 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                 replays_openai_history=self._replays_openai_history,
                 structured_output=self._structured_output,
                 item_phase=self._item_phase(chunk),
-                streamed_phases=bool(self._message_phases),
                 reasoning_summary_streamed=self._reasoning_summary_streamed,
             )
         )

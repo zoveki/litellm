@@ -4,6 +4,7 @@ import re
 import time
 import traceback
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from itertools import chain
 from types import MappingProxyType
 from typing import Final, Literal, cast
@@ -217,6 +218,15 @@ def _pieces_in_phase(text: str, phase: Mapping[str, object]) -> Iterator[tuple[s
     return ((piece, phase) for piece in _content_pieces(text))
 
 
+_NO_FIELDS: Final[Mapping[str, object]] = MappingProxyType({})
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayChunk:
+    delta: Delta
+    provider_specific_fields: Mapping[str, object] = _NO_FIELDS
+
+
 def _replay_pieces(
     content: str | None, provider_specific_fields: object
 ) -> tuple[tuple[str, Mapping[str, object]], ...]:
@@ -224,65 +234,60 @@ def _replay_pieces(
 
     messages: Final = phased_message_texts(provider_specific_fields, content) if content else ()
     if not messages:
-        return tuple(_pieces_in_phase(content or "", MappingProxyType({})))
+        return tuple(_pieces_in_phase(content or "", _NO_FIELDS))
     return tuple(
-        chain.from_iterable(_pieces_in_phase(text, MappingProxyType({PHASE_FIELD: phase})) for text, phase in messages)
+        chain.from_iterable(
+            _pieces_in_phase(text, MappingProxyType({PHASE_FIELD: phase}) if phase is not None else _NO_FIELDS)
+            for text, phase in messages
+        )
     )
 
 
-def _phased_provider_fields(slice_fields: Mapping[str, object], phase: Mapping[str, object]) -> Mapping[str, object]:
-    if not phase:
-        return MappingProxyType({})
-    cached: Final = slice_fields.get("provider_specific_fields")
-    return MappingProxyType(
-        {
-            "provider_specific_fields": {
-                **(_FIELD_MAP.validate_python(cached) if isinstance(cached, dict) else {}),
-                **phase,
-            }
-        }
-    )
-
-
-def _replay_deltas(delta: Delta) -> tuple[Delta, ...]:
+def _replay_chunks(delta: Delta) -> tuple[_ReplayChunk, ...]:
     fields: Final[dict[str, object]] = delta.model_dump(exclude_none=True)
     lead: Final = _fields_in(fields, _REPLAY_LEAD_FIELDS) if _REPLAY_REASONING_FIELDS.intersection(fields) else {}
     pieces: Final = _replay_pieces(delta.content, fields.get("provider_specific_fields"))
     if not pieces and not lead:
-        return (delta,)
+        return (_ReplayChunk(delta),)
     if not pieces:
         held_back: Final = lead.keys() | {"content"}
         rest: Final = {key: value for key, value in fields.items() if key not in held_back}
-        return (Delta.model_validate(lead),) + ((Delta.model_validate(rest),) if rest else ())
+        return (_ReplayChunk(Delta.model_validate(lead)),) + (
+            (_ReplayChunk(Delta.model_validate(rest)),) if rest else ()
+        )
     tools: Final = _fields_in(fields, _REPLAY_TOOL_FIELDS)
     annotations: Final = _fields_in(fields, frozenset({"annotations"}))
     moved: Final = lead.keys() | _REPLAY_TOOL_FIELDS | _REPLAY_TEXT_FIELDS
     first_slice: Final = {key: value for key, value in fields.items() if key not in moved}
     last_index: Final = len(pieces) - 1
     return (
-        ((Delta.model_validate(lead),) if lead else ())
+        ((_ReplayChunk(Delta.model_validate(lead)),) if lead else ())
         + tuple(
-            Delta.model_validate(
-                {
-                    **(first_slice if index == 0 else {}),
-                    "content": piece,
-                    **(annotations if index == last_index else {}),
-                    **_phased_provider_fields(first_slice if index == 0 else {}, phase),
-                }
+            _ReplayChunk(
+                Delta.model_validate(
+                    {
+                        **(first_slice if index == 0 else {}),
+                        "content": piece,
+                        **(annotations if index == last_index else {}),
+                    }
+                ),
+                phase,
             )
             for index, (piece, phase) in enumerate(pieces)
         )
-        + ((Delta.model_validate(tools),) if tools else ())
+        + ((_ReplayChunk(Delta.model_validate(tools)),) if tools else ())
     )
 
 
 def _replay_frame(
-    response: ModelResponseStream, delta: Delta, finish_reason: str | None, keeps_choice_metadata: bool
+    response: ModelResponseStream, chunk: _ReplayChunk, finish_reason: str | None, keeps_choice_metadata: bool
 ) -> ModelResponseStream:
     frame: Final = response.model_copy(deep=True)
     choice: Final = frame.choices[0]
-    choice.delta = delta
+    choice.delta = chunk.delta
     choice.finish_reason = finish_reason
+    if chunk.provider_specific_fields:
+        frame.provider_specific_fields = {**(frame.provider_specific_fields or {}), **chunk.provider_specific_fields}
     if not keeps_choice_metadata:
         choice.logprobs = None
         _drop_choice_fields(choice, ("enhancements", *STREAM_CHUNK_CHOICE_FIELDS))
@@ -299,12 +304,12 @@ def _replay_frames(response: ModelResponseStream) -> Iterator[ModelResponseStrea
     if usage is not None:
         delattr(response, "usage")
     choice: Final = response.choices[0]
-    deltas: Final = _replay_deltas(choice.delta)
-    first_text: Final = next((index for index, delta in enumerate(deltas) if delta.content), 0)
-    for index, delta in enumerate(deltas):
-        yield _replay_frame(response, delta, finish_reason=None, keeps_choice_metadata=index == first_text)
+    chunks: Final = _replay_chunks(choice.delta)
+    first_text: Final = next((index for index, chunk in enumerate(chunks) if chunk.delta.content), 0)
+    for index, chunk in enumerate(chunks):
+        yield _replay_frame(response, chunk, finish_reason=None, keeps_choice_metadata=index == first_text)
     finish_frame: Final = _replay_frame(
-        response, Delta(), finish_reason=choice.finish_reason, keeps_choice_metadata=False
+        response, _ReplayChunk(Delta()), finish_reason=choice.finish_reason, keeps_choice_metadata=False
     )
     if usage is not None:
         setattr(finish_frame, "usage", usage)

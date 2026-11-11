@@ -8,6 +8,8 @@ from typing import Final
 import httpx
 import pytest
 import respx
+from openai.lib.streaming.chat import ChatCompletionStreamState
+from openai.types.chat import ChatCompletionChunk
 
 import litellm
 from litellm.completion_extras.litellm_responses_transformation import history
@@ -433,15 +435,11 @@ def test_a_phase_openai_does_not_define_is_rejected_without_drop_params(model: s
 def _phase_runs(chunks: Sequence[ModelResponseStream]) -> list[tuple[object, str]]:
     return [
         (phase, "".join(str(text) for text, _ in run))
-        for phase, run in groupby(_text_delta_phases(chunks), key=itemgetter(1))
+        for phase, run in groupby(_text_chunk_phases(chunks), key=itemgetter(1))
     ]
 
 
-@pytest.mark.parametrize("model", [OPENAI_MODEL, AZURE_MODEL], ids=["openai", "azure"])
-@pytest.mark.parametrize("reasoning", [True, False], ids=["with-reasoning", "text-only"])
-def test_a_cached_turn_replayed_as_a_stream_labels_each_text_chunk_with_its_message_phase(
-    model: str, reasoning: bool
-) -> None:
+def _cached_chunks(model: str, reasoning: bool = True) -> tuple[ModelResponseStream, ...]:
     assistant: Final = _assistant_turn(OUTPUT, stream=False, model=model)
     reasoning_fields: Final = frozenset({"reasoning_content", "reasoning_items", "thinking_blocks"})
     message: Final = {key: value for key, value in assistant.items() if reasoning or key not in reasoning_fields}
@@ -452,12 +450,19 @@ def test_a_cached_turn_replayed_as_a_stream_labels_each_text_chunk_with_its_mess
         "model": MODEL,
         "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
     }
+    return tuple(convert_to_streaming_response(cached))
 
-    chunks: Final = list(convert_to_streaming_response(cached))
+
+@pytest.mark.parametrize("model", [OPENAI_MODEL, AZURE_MODEL], ids=["openai", "azure"])
+@pytest.mark.parametrize("reasoning", [True, False], ids=["with-reasoning", "text-only"])
+def test_a_cached_turn_replayed_as_a_stream_labels_each_text_chunk_with_its_message_phase(
+    model: str, reasoning: bool
+) -> None:
+    chunks: Final = _cached_chunks(model, reasoning)
 
     assert _phase_runs(chunks) == [("commentary", "Checking the weather."), ("final_answer", "Paris: light rain.")]
-    rebuilt: Final = litellm.stream_chunk_builder(chunks).choices[0].message
-    assert rebuilt.provider_specific_fields == assistant["provider_specific_fields"]
+    rebuilt: Final = litellm.stream_chunk_builder(list(chunks)).choices[0].message
+    assert rebuilt.provider_specific_fields == _assistant_turn(OUTPUT, stream=False, model=model)["provider_specific_fields"]
 
 
 @pytest.mark.parametrize("fields", [None, ["not", "a", "mapping"]], ids=["no-fields", "malformed-fields"])
@@ -569,12 +574,12 @@ def test_an_interrupted_stream_records_no_replay() -> None:
     assistant: Final = litellm.stream_chunk_builder(list(received), messages=[USER]).choices[0].message.model_dump()
 
     assert assistant["content"] == "Checking the weather.Paris: light rain."
-    assert _replayed_fields(assistant) == {"phase": "final_answer"}
+    assert _replayed_fields(assistant) == {}
 
 
-def _text_delta_phases(chunks: Sequence[object]) -> list[tuple[object, object]]:
-    deltas: Final = tuple(chunk.choices[0].delta for chunk in chunks if chunk.choices and chunk.choices[0].delta.content)
-    return [(delta.content, (delta.provider_specific_fields or {}).get("phase")) for delta in deltas]
+def _text_chunk_phases(chunks: Sequence[object]) -> list[tuple[object, object]]:
+    texts: Final = tuple(chunk for chunk in chunks if chunk.choices and chunk.choices[0].delta.content)
+    return [(chunk.choices[0].delta.content, (chunk.provider_specific_fields or {}).get("phase")) for chunk in texts]
 
 
 @pytest.mark.parametrize(
@@ -587,17 +592,41 @@ def _text_delta_phases(chunks: Sequence[object]) -> list[tuple[object, object]]:
     ids=["openai", "azure", "xai"],
 )
 @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
-async def test_each_streamed_text_delta_carries_the_phase_of_its_message(
+async def test_each_streamed_text_chunk_carries_the_phase_of_its_message(
     model: str, commentary_phase: str | None, answer_phase: str | None, use_async: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     chunks: Final = await _async_streamed_chunks(model) if use_async else _streamed_chunks(model)
 
-    assert _text_delta_phases(chunks) == [
+    assert _text_chunk_phases(chunks) == [
         ("Checking the weather.", commentary_phase),
         ("Paris: ", answer_phase),
         ("light rain.", answer_phase),
     ]
+
+
+def _openai_sdk_message(chunks: Sequence[object]) -> dict[str, object]:
+    state: Final = ChatCompletionStreamState()
+    for chunk in chunks:
+        state.handle_chunk(
+            ChatCompletionChunk.model_validate(
+                {"model": MODEL, **json.loads(chunk.model_dump_json(exclude_none=True, exclude_unset=True))}
+            )
+        )
+    return state.get_final_completion().choices[0].message.model_dump(exclude_none=True)
+
+
+@pytest.mark.parametrize("model", [OPENAI_MODEL, AZURE_MODEL], ids=["openai", "azure"])
+@pytest.mark.parametrize("stream_of", [_streamed_chunks, _cached_chunks], ids=["live", "cache-hit"])
+def test_a_stream_assembled_by_the_openai_sdk_keeps_one_phase_and_replays_the_next_turn(
+    model: str, stream_of: Callable[[str], Sequence[object]]
+) -> None:
+    assistant: Final = _openai_sdk_message(stream_of(model))
+
+    sent: Final = _next_turn_input(assistant, model=model)
+
+    assert _replayed_fields(assistant)["phase"] == "final_answer"
+    assert sent[1:-1] == list(REPLAYED)
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["json", "stream"])
