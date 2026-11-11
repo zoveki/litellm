@@ -4,6 +4,7 @@ import re
 import time
 import traceback
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from itertools import chain
 from types import MappingProxyType
 from typing import Final, Literal, cast
 
@@ -208,10 +209,45 @@ def _fields_in(fields: Mapping[str, object], keys: frozenset[str]) -> dict[str, 
     return {key: value for key, value in fields.items() if key in keys}
 
 
+def _content_pieces(content: str | None) -> tuple[str, ...]:
+    return tuple(_split_assembled_content_for_replay(content)) or ((content,) if content else ())
+
+
+def _pieces_in_phase(text: str, phase: Mapping[str, object]) -> Iterator[tuple[str, Mapping[str, object]]]:
+    return ((piece, phase) for piece in _content_pieces(text))
+
+
+def _replay_pieces(
+    content: str | None, provider_specific_fields: object
+) -> tuple[tuple[str, Mapping[str, object]], ...]:
+    from litellm.completion_extras.litellm_responses_transformation.history import PHASE_FIELD, phased_message_texts
+
+    messages: Final = phased_message_texts(provider_specific_fields, content) if content else ()
+    if not messages:
+        return tuple(_pieces_in_phase(content or "", MappingProxyType({})))
+    return tuple(
+        chain.from_iterable(_pieces_in_phase(text, MappingProxyType({PHASE_FIELD: phase})) for text, phase in messages)
+    )
+
+
+def _phased_provider_fields(slice_fields: Mapping[str, object], phase: Mapping[str, object]) -> Mapping[str, object]:
+    if not phase:
+        return MappingProxyType({})
+    cached: Final = slice_fields.get("provider_specific_fields")
+    return MappingProxyType(
+        {
+            "provider_specific_fields": {
+                **(_FIELD_MAP.validate_python(cached) if isinstance(cached, dict) else {}),
+                **phase,
+            }
+        }
+    )
+
+
 def _replay_deltas(delta: Delta) -> tuple[Delta, ...]:
     fields: Final[dict[str, object]] = delta.model_dump(exclude_none=True)
     lead: Final = _fields_in(fields, _REPLAY_LEAD_FIELDS) if _REPLAY_REASONING_FIELDS.intersection(fields) else {}
-    pieces: Final = _split_assembled_content_for_replay(delta.content) or ([delta.content] if delta.content else [])
+    pieces: Final = _replay_pieces(delta.content, fields.get("provider_specific_fields"))
     if not pieces and not lead:
         return (delta,)
     if not pieces:
@@ -231,9 +267,10 @@ def _replay_deltas(delta: Delta) -> tuple[Delta, ...]:
                     **(first_slice if index == 0 else {}),
                     "content": piece,
                     **(annotations if index == last_index else {}),
+                    **_phased_provider_fields(first_slice if index == 0 else {}, phase),
                 }
             )
-            for index, piece in enumerate(pieces)
+            for index, (piece, phase) in enumerate(pieces)
         )
         + ((Delta.model_validate(tools),) if tools else ())
     )

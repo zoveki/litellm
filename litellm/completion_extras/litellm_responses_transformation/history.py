@@ -331,6 +331,25 @@ def _message_texts(entries: Sequence[_MessageEntry], content: str) -> tuple[tupl
     return tuple(parts[start:end] for start, end in pairwise(groups))
 
 
+class _StoredReplay(_Frozen):
+    openai_responses_replay: _Replay
+
+
+def phased_message_texts(provider_specific_fields: object, content: str) -> tuple[tuple[str, Phase | None], ...]:
+    try:
+        replay: Final = _StoredReplay.model_validate(provider_specific_fields).openai_responses_replay
+    except ValidationError:
+        return ()
+    entries: Final = tuple(entry for entry in replay.items if isinstance(entry, _MessageEntry))
+    if sum(chain.from_iterable(entry.parts for entry in entries)) != len(content):
+        return ()
+    if all(entry.phase is None for entry in entries):
+        return ()
+    return tuple(
+        ("".join(texts), entry.phase) for texts, entry in zip(_message_texts(entries, content), entries, strict=True)
+    )
+
+
 def _message_item(texts: Sequence[str], phase: Phase | None) -> Mapping[str, object]:
     return {
         "type": "message",

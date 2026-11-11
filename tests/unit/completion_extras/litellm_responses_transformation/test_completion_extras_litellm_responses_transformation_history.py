@@ -1,5 +1,7 @@
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from itertools import groupby
+from operator import itemgetter
 from types import MappingProxyType
 from typing import Final
 
@@ -10,6 +12,8 @@ import respx
 import litellm
 from litellm.completion_extras.litellm_responses_transformation import history
 from litellm.exceptions import MidStreamFallbackError
+from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import convert_to_streaming_response
+from litellm.types.utils import ModelResponseStream
 
 OPENAI_RESPONSES_URL: Final = "https://api.openai.com/v1/responses"
 AZURE_API_BASE: Final = "https://litellm-history-test.openai.azure.com"
@@ -393,31 +397,67 @@ def test_a_last_message_the_bridge_cannot_read_leaves_the_turn_without_a_phase(s
     assert _replayed_fields(assistant).get("phase") is None
 
 
-def test_a_phase_openai_does_not_define_is_dropped_under_drop_params() -> None:
-    assistant: Final = _assistant_turn(OUTPUT, stream=False)
+@pytest.mark.parametrize("model", [OPENAI_MODEL, AZURE_MODEL], ids=["openai", "azure"])
+def test_a_phase_openai_does_not_define_is_dropped_under_drop_params(model: str) -> None:
+    assistant: Final = _assistant_turn(OUTPUT, stream=False, model=model)
 
-    sent: Final = _next_turn_input({**assistant, "provider_specific_fields": {"phase": "analysis"}}, drop_params=True)
+    sent: Final = _next_turn_input(
+        {**assistant, "provider_specific_fields": {"phase": "analysis"}}, model=model, drop_params=True
+    )
 
     assert _types(sent[1:-1]) == ["reasoning", "reasoning", "message", "function_call"]
     assert "phase" not in sent[3]
 
 
-def test_a_phase_openai_does_not_define_is_rejected_without_drop_params() -> None:
-    assistant: Final = _assistant_turn(OUTPUT, stream=False)
+@pytest.mark.parametrize("model", [OPENAI_MODEL, AZURE_MODEL], ids=["openai", "azure"])
+def test_a_phase_openai_does_not_define_is_rejected_without_drop_params(model: str) -> None:
+    assistant: Final = _assistant_turn(OUTPUT, stream=False, model=model)
+    upstream_url, route_params = _route(model)
 
     with respx.mock(assert_all_called=False) as router:
-        upstream: Final = router.post(url__startswith=OPENAI_RESPONSES_URL).mock(
+        upstream: Final = router.post(url__startswith=upstream_url).mock(
             return_value=httpx.Response(200, json=_response((FOLLOW_UP,)))
         )
         with pytest.raises(litellm.BadRequestError, match="'analysis'"):
             litellm.completion(
-                model=OPENAI_MODEL,
+                model=model,
                 messages=[USER, {**assistant, "phase": "analysis"}, TOOL_RESULT],
                 tools=list(TOOLS),
                 api_key="sk-test",
+                **route_params,
             )
 
     assert not upstream.called
+
+
+def _phase_runs(chunks: Sequence[ModelResponseStream]) -> list[tuple[object, str]]:
+    return [
+        (phase, "".join(str(text) for text, _ in run))
+        for phase, run in groupby(_text_delta_phases(chunks), key=itemgetter(1))
+    ]
+
+
+@pytest.mark.parametrize("model", [OPENAI_MODEL, AZURE_MODEL], ids=["openai", "azure"])
+@pytest.mark.parametrize("reasoning", [True, False], ids=["with-reasoning", "text-only"])
+def test_a_cached_turn_replayed_as_a_stream_labels_each_text_chunk_with_its_message_phase(
+    model: str, reasoning: bool
+) -> None:
+    assistant: Final = _assistant_turn(OUTPUT, stream=False, model=model)
+    reasoning_fields: Final = frozenset({"reasoning_content", "reasoning_items", "thinking_blocks"})
+    message: Final = {key: value for key, value in assistant.items() if reasoning or key not in reasoning_fields}
+    cached: Final = {
+        "id": "chatcmpl-cached",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": MODEL,
+        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+    }
+
+    chunks: Final = list(convert_to_streaming_response(cached))
+
+    assert _phase_runs(chunks) == [("commentary", "Checking the weather."), ("final_answer", "Paris: light rain.")]
+    rebuilt: Final = litellm.stream_chunk_builder(chunks).choices[0].message
+    assert rebuilt.provider_specific_fields == assistant["provider_specific_fields"]
 
 
 @pytest.mark.parametrize("fields", [None, ["not", "a", "mapping"]], ids=["no-fields", "malformed-fields"])
