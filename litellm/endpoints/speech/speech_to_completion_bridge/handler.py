@@ -31,11 +31,11 @@ def _headers_as_text(extra_headers: Mapping[str, object] | None) -> Mapping[str,
 class SpeechToCompletionBridgeHandlerInputKwargs(TypedDict):
     model: str
     input: str
-    voice: str | dict | None
+    voice: str | dict[str, object] | None
     optional_params: dict[str, object]
-    litellm_params: dict
+    litellm_params: dict[str, object]
     logging_obj: "LiteLLMLoggingObj"
-    headers: dict
+    headers: dict[str, object]
     custom_llm_provider: str
 
 
@@ -96,10 +96,10 @@ class SpeechToCompletionBridgeHandler:
         self,
         model: str,
         input: str,
-        voice: str | dict | None,
-        optional_params: dict,
-        litellm_params: dict,
-        headers: dict,
+        voice: str | Mapping[str, object] | None,
+        optional_params: Mapping[str, object],
+        litellm_params: Mapping[str, object],
+        headers: Mapping[str, object],
         logging_obj: "LiteLLMLoggingObj",
         custom_llm_provider: str,
         api_base: str | None,
